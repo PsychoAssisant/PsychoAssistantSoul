@@ -4,9 +4,20 @@ setup(
     name="PsychoAssistantSoul",              # nazwa pakietu
     version="0.1.0",                 # wersja pakietu
     packages=find_packages(),        # automatyczne znajdowanie modułów w folderze
-    install_requires=[               # wymagane zależności
-        "transformers>=4.0.0",
-        "torch>=1.7.0"
+    install_requires=[
+        # core
+        "transformers>=4.57.1,<5",
+        "torch>=2.9.1,<3",
+
+        # wymagane przez tokenizery T5 / niektóre modele HF
+        "sentencepiece>=0.2.1",
+
+        # biblioteki HF, które czasem warto jawnie zadeklarować
+        "huggingface-hub>=0.36.0",
+        "tokenizers>=0.22.1",
+
+        # opcjonalne (przydatne jeśli używasz safetensors / szybszego ładowania modeli)
+        "safetensors>=0.6.2"
     ],
     author="Jacek Walczak",             # autor pakietu
     author_email="jacekwalczak4@gmail.com",  # email autora (opcjonalnie)
