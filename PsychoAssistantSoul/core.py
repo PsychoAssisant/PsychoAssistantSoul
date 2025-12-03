@@ -1,179 +1,398 @@
 import json
-from typing import Union, List, Dict
+import logging
+import os
+from typing import Union, List, Dict, Any
 
+from openai import OpenAI
 from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
     T5Tokenizer,
     T5ForConditionalGeneration,
-    pipeline,
 )
+
+# --- LOGGING CONFIGURATION ---
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 
 class ChatbotSDK:
-    def __init__(self, model_name: str = "microsoft/DialoGPT-medium"):
-        # Model konwersacyjny
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
+    """
+    Chatbot SDK using Perplexity Sonar API (OpenAI-compatible chat completions).
 
-        # Model do wyciągania słów kluczowych (zostawiam, jak u Ciebie)
-        self.model_name_base_words = "Voicelab/vlt5-base-keywords"
-        self.tokenizer_base_words = T5Tokenizer.from_pretrained(self.model_name_base_words)
-        self.model_base_words = T5ForConditionalGeneration.from_pretrained(self.model_name_base_words)
+    - Uses Perplexity's /chat/completions endpoint via OpenAI client.
+    - Reads API key from PERPLEXITY_API_KEY environment variable.
+    - Builds natural-language context from Elasticsearch-like JSON.
+    - Detects simple question type (yes/no, list, explanation, other)
+      and adjusts the style of the answer.
+    - Still provides a T5-based keyword extractor (optional usage).
+    """
 
-        # NEW: pipeline Question Answering (możesz podmienić model na inny, np. PL)
-        # np. "deepset/xlm-roberta-base-squad2" (wielojęzyczny)
-        self.qa = pipeline(
-            "question-answering",
-            model="distilbert-base-cased-distilled-squad"
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "sonar",
+    ):
+        logger.info("Initializing ChatbotSDK with Perplexity model: %s", model_name)
+
+        self.model_name = model_name
+
+        # api_key = os.getenv("PERPLEXITY_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "Environment variable PERPLEXITY_API_KEY is not set. "
+                "Create an API key in Perplexity settings and export it "
+                "as PERPLEXITY_API_KEY."
+            )
+
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.perplexity.ai",
         )
+        logger.info("Perplexity client configured (OpenAI-compatible).")
 
-    # --- POMOCNICZE: budowa tekstowego contextu z odpowiedzi Elasticsearch ---
+        # Optional keyword extraction model (same as you had before)
+        self.model_name_base_words = "Voicelab/vlt5-base-keywords"
+        logger.info("Loading keyword extraction model: %s", self.model_name_base_words)
+        self.tokenizer_base_words = T5Tokenizer.from_pretrained(
+            self.model_name_base_words,
+            legacy=True,  # keep old behavior, silence warning
+        )
+        self.model_base_words = T5ForConditionalGeneration.from_pretrained(
+            self.model_name_base_words
+        )
+        logger.info("Keyword extraction model loaded.")
+
+    def _detect_question_type(self, question: str) -> str:
+        """
+        Very simple question type heuristic:
+        - "yes_no"   – question likely expecting yes/no (is/are/do/can/etc.)
+        - "list"     – asking to list/enumerate things
+        - "why_how"  – asking for explanation (how/why)
+        - "other"    – everything else
+        """
+        q = question.strip().lower()
+        logger.debug("Detecting question type for: %s", q)
+
+        if q.startswith(
+            ("is ", "are ", "do ", "does ", "can ", "should ", "will ", "would ")
+        ):
+            logger.debug("Detected question type: yes_no")
+            return "yes_no"
+
+        list_keywords = [
+            "list",
+            "enumerate",
+            "what are",
+            "which are",
+            "give me the list",
+            "show me the list",
+            "provide the list",
+        ]
+        if any(kw in q for kw in list_keywords):
+            logger.debug("Detected question type: list")
+            return "list"
+
+        why_how_keywords = [
+            "how ",
+            "how do",
+            "how does",
+            "why ",
+            "explain",
+            "for what reason",
+            "in what way",
+        ]
+        if any(kw in q for kw in why_how_keywords):
+            logger.debug("Detected question type: why_how")
+            return "why_how"
+
+        logger.debug("Detected question type: other")
+        return "other"
 
     def _build_context_from_es(
         self,
-        context: Union[bytes, str, List[Dict], Dict]
+        context: Union[bytes, str, List[Dict[str, Any]], Dict[str, Any], None]
     ) -> str:
         """
-        Przyjmuje:
-        - bytes (surowa odpowiedź z ES),
-        - string z JSON-em,
-        - listę słowników (już sparsowane),
-        - pojedynczy słownik.
+        Normalizes various forms of Elasticsearch-like responses into
+        a readable English context string.
 
-        Zwraca tekst po polsku, który pójdzie jako 'context' do QA pipeline.
+        Accepts:
+        - bytes (raw JSON),
+        - string (raw JSON or plain text),
+        - list[dict] (parsed),
+        - dict (single item),
+        - None.
+
+        Returns:
+            str – human-readable context.
         """
-        # 1. Normalizacja do obiektu Pythona
+        if context is None:
+            logger.debug("Context is None – returning empty string.")
+            return ""
+
+        logger.debug("Building context from ES. Input type: %s", type(context))
+
         if isinstance(context, bytes):
-            context = context.decode("utf-8")
+            try:
+                context = context.decode("utf-8")
+                logger.debug("Decoded bytes to UTF-8 string.")
+            except Exception as e:
+                logger.warning("Failed to decode bytes: %s", e)
+                return str(context)
 
         if isinstance(context, str):
-            # Zakładamy że to JSON (np. z ES)
-            context = json.loads(context)
+            try:
+                parsed = json.loads(context)
+                context = parsed
+                logger.debug("String successfully parsed as JSON.")
+            except Exception:
+                logger.info(
+                    "String is not valid JSON – using it directly as context text."
+                )
+                return context
 
-        # Teraz context to dict albo list[dict]
         if isinstance(context, dict):
-            items = [context]
-        elif isinstance(context, list):
-            items = context
+            items: List[Dict[str, Any]] = [context]
+        elif isinstance(context, list) and all(isinstance(x, dict) for x in context):
+            items = context  # type: ignore
         else:
-            # Jak coś dziwnego – po prostu rzutujemy na string
+            logger.warning(
+                "Unexpected context type after normalization (%s) – casting to string.",
+                type(context),
+            )
             return str(context)
 
-        # 2. Budowa kontekstu tekstowego
-        parts = []
-        for clinic in items:
-            name = clinic.get("name", "Brak nazwy")
-            description = clinic.get("description", "")
-            open_time = clinic.get("open", "")
-            close_time = clinic.get("close", "")
-            payment_methods = clinic.get("paymentMethods", [])
+        logger.info("Number of items in context: %d", len(items))
 
-            part = (
-                f"Nazwa kliniki: {name}. "
-                f"Opis: {description}. "
-                f"Godziny otwarcia: od {open_time} do {close_time}. "
-                f"Metody płatności: {', '.join(payment_methods)}."
-            )
-            parts.append(part)
+        parts: List[str] = []
 
-        return "\n".join(parts)
+        for idx, item in enumerate(items, start=1):
+            name = item.get("name") or item.get("clinicName") or item.get("title")
+            description = item.get("description")
+            open_time = item.get("open") or item.get("openTime")
+            close_time = item.get("close") or item.get("closeTime")
+            payment_methods = item.get("paymentMethods") or item.get("payments")
+            address = item.get("address")
+            city = item.get("city")
 
-    # --- GŁÓWNA FUNKCJA ODPOWIEDZI ---
+            lines: List[str] = [f"Result item {idx}:"]
 
-    def get_response(self, user_input: str, context: dict | bytes | str | list | None) -> str:
-        """
-        Jeżeli jest kontekst z Elasticsearch:
-        - buduje z niego tekst,
-        - używa pipeline QA, żeby odpowiedzieć NA PODSTAWIE TEGO KONTEKSTU.
-
-        Jeżeli kontekstu brak lub jest pusty:
-        - fallback do modelu konwersacyjnego DialoGPT.
-        """
-
-        # 1. Jeśli mamy kontekst z ES – użyj QA
-        if context:
-            context_text = self._build_context_from_es(context)
-
-            if context_text.strip():
-                qa_answer = self.qa(
-                    question=user_input,
-                    context=context_text
+            if name:
+                lines.append(f"- Name: {name}.")
+            if description:
+                lines.append(f"- Description: {description}.")
+            if address or city:
+                if address and city:
+                    lines.append(f"- Address: {address}, {city}.")
+                elif address:
+                    lines.append(f"- Address: {address}.")
+                elif city:
+                    lines.append(f"- City: {city}.")
+            if open_time or close_time:
+                if open_time and close_time:
+                    lines.append(f"- Opening hours: from {open_time} to {close_time}.")
+                elif open_time:
+                    lines.append(f"- Opening hours: from {open_time}.")
+                elif close_time:
+                    lines.append(f"- Opening hours: until {close_time}.")
+            if isinstance(payment_methods, list) and payment_methods:
+                lines.append(
+                    f"- Payment methods: {', '.join(map(str, payment_methods))}."
                 )
+            elif isinstance(payment_methods, str):
+                lines.append(f"- Payment methods: {payment_methods}.")
 
-                # qa_answer ma formę: {"score": ..., "start": ..., "end": ..., "answer": "..."}
-                raw_ans = qa_answer.get("answer", "").strip()
+            parts.append("\n".join(lines))
 
-                # Prosta interpretacja "tak/nie" dla pytań o BLIK itp.
-                # Możesz to dopracować wg potrzeb.
-                lower_q = user_input.lower()
-                lower_ans = raw_ans.lower()
+        full_context = "\n\n".join(parts)
 
-                # Przykład: pytanie o BLIK
-                if "blik" in lower_q:
-                    if "blik" in lower_ans:
-                        return "Tak, klinika przyjmuje płatności BLIK."
-                    else:
-                        # Dodatkowy check w samym kontekście na wszelki wypadek:
-                        if "blik" in context_text.lower():
-                            return "Tak, klinika przyjmuje płatności BLIK."
-                        else:
-                            return "Nie widzę w kontekście informacji, że klinika przyjmuje płatności BLIK."
+        max_chars = 4000
+        if len(full_context) > max_chars:
+            logger.info("Context longer than %d chars – truncating.", max_chars)
+            full_context = (
+                full_context[:max_chars]
+                + "\n\n[Context truncated due to length for the model.]"
+            )
 
-                # Domyślnie zwracamy po prostu fragment odpowiedzi modelu QA
-                return raw_ans or "Nie potrafię jednoznacznie odpowiedzieć na to pytanie na podstawie podanego kontekstu."
+        logger.debug("Built context (first 500 chars): %s", full_context[:500])
+        return full_context
 
-        # 2. Brak sensownego kontekstu – standardowa odpowiedź generatywna
-        context_json = json.dumps(context or {}, ensure_ascii=False)
 
-        prompt = f"Kontekst: {context_json}\nUżytkownik: {user_input}\nAsystent:"
-        input_ids = self.tokenizer.encode(prompt + self.tokenizer.eos_token, return_tensors="pt")
+    def get_response(
+        self,
+        user_input: str,
+        context: Union[Dict[str, Any], bytes, str, List[Dict[str, Any]], None] = None
+    ) -> str:
+        """
+        Main method to generate a response using Perplexity Sonar.
 
-        chat_history_ids = self.model.generate(
-            input_ids,
-            max_length=1000,
-            pad_token_id=self.tokenizer.eos_token_id,
-            do_sample=True,
-            top_p=0.9,
-            top_k=50
+        - If context is provided, it's turned into human-readable text and
+          passed together with the question.
+        - If no context: the model answers using only the question.
+
+        The answer style is slightly tuned based on the detected question type.
+        """
+        logger.info("User question: %s", user_input)
+
+        question_type = self._detect_question_type(user_input)
+        logger.info("Detected question type: %s", question_type)
+
+        try:
+            context_text = (
+                self._build_context_from_es(context) if context is not None else ""
+            )
+        except Exception as e:
+            logger.error("Error while building context: %s", e, exc_info=True)
+            context_text = ""
+
+        context_text = context_text.strip()
+        has_context = bool(context_text)
+
+        if has_context:
+            logger.info("Context provided (length: %d chars).", len(context_text))
+        else:
+            logger.info("No usable context – answering based only on the question.")
+
+        base_instruction = (
+            "You are a helpful assistant. Answer the user's question in English clearly and naturally. "
+            "The answer should be based solely on context"
+            "If the context does not contain the necessary information, explicitly say that you don't know "
+            "instead of inventing details."
         )
 
-        response_text = self.tokenizer.decode(
-            chat_history_ids[:, input_ids.shape[-1]:][0],
-            skip_special_tokens=True
-        )
-        return response_text
+        if question_type == "yes_no":
+            style_instruction = (
+                "If possible, start your answer with 'Yes' or 'No' and then add a brief explanation."
+            )
+        elif question_type == "list":
+            style_instruction = (
+                "If it makes sense, respond using a short bullet list. Keep each item concise."
+            )
+        elif question_type == "why_how":
+            style_instruction = (
+                "Provide a short, understandable explanation in about 2–4 sentences."
+            )
+        else:
+            style_instruction = "Answer concisely in 1–3 short sentences."
 
-    def extract_keywords(self, text, max_keywords=3):
-        # przyjęty prefix może być: "Keywords: " albo inny w zależności od modelu
+        system_prompt = base_instruction + " " + style_instruction
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+
+        if has_context:
+            user_content = f"Context:\n{context_text}\n\nUser question: {user_input}"
+        else:
+            user_content = f"User question: {user_input}"
+
+        messages.append({"role": "user", "content": user_content})
+
+        logger.debug("Sending request to Perplexity (model: %s)", self.model_name)
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.4,
+                max_tokens=512,
+            )
+
+            answer = completion.choices[0].message.content.strip()
+            if not answer:
+                logger.warning("Model returned an empty answer.")
+                return "I cannot provide a good answer at the moment."
+
+            logger.info("Generated answer (first 200 chars): %s", answer[:200])
+            return answer
+
+        except Exception as e:
+            logger.error("Error calling Perplexity API: %s", e, exc_info=True)
+            return "An error occurred while generating the response."
+
+    def extract_keywords(self, text: str, max_keywords: int = 3) -> List[str]:
+        """
+        Extracts keywords using a T5-based model (Voicelab/vlt5-base-keywords).
+        Returns at most `max_keywords` keyword phrases.
+        """
+        logger.info("Extracting keywords from text (length: %d chars).", len(text))
+
         prefix = "Keywords: "
         input_text = prefix + text.strip()
-        inputs = self.tokenizer_base_words(input_text, return_tensors="pt", truncation=True, max_length=512)
 
-        outputs = self.model_base_words.generate(
-            inputs["input_ids"],
-            max_length=32,
-            num_beams=4,
-            no_repeat_ngram_size=2,
-            early_stopping=True
-        )
-        generated = self.tokenizer_base_words.decode(outputs[0], skip_special_tokens=True)
-        # np. wygenerowany: "słowo1, słowo2, słowo3"
-        keywords = [w.strip() for w in generated.split(",")]
-        return keywords[:max_keywords]
+        try:
+            inputs = self.tokenizer_base_words(
+                input_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )
+
+            outputs = self.model_base_words.generate(
+                inputs["input_ids"],
+                max_length=32,
+                num_beams=4,
+                no_repeat_ngram_size=2,
+                early_stopping=True,
+            )
+            generated = self.tokenizer_base_words.decode(
+                outputs[0],
+                skip_special_tokens=True,
+            )
+            keywords = [w.strip() for w in generated.split(",") if w.strip()]
+            result = keywords[:max_keywords]
+
+            logger.info("Extracted keywords: %s", result)
+            return result
+
+        except Exception as e:
+            logger.error("Error during keyword extraction: %s", e, exc_info=True)
+            return []
+
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
     bot = ChatbotSDK()
-    print("SDK gotowy do pracy. Wpisz 'exit', aby zakończyć.")
+    print("SDK ready. Type 'exit' to quit.\n")
 
-    # przykładowe użycie:
-    # text = "Jak mogę zabezpieczyć dostęp do bazy danych w aplikacji webowej?"
-    # print(bot.extract_keywords(text))
+    # Example ES-like context
+    sample_context = [
+        {
+            "id": "b5857557-0143-4989-b16b-6c66034efdd7",
+            "name": "Alpha Clinic",
+            "description": "Treatment of sleep disorders",
+            "open": "09:00:00",
+            "close": "20:00:00",
+            "paymentMethods": ["BLIK", "CASH"],
+        },
+        {
+            "id": "4d8b49d7-d99b-42d8-b4ed-2001558880a0",
+            "name": "Theta Clinic",
+            "description": "Treatment of depression and mood disorders",
+            "open": "08:00:00",
+            "close": "20:00:00",
+            "paymentMethods": ["BLIK", "CARD", "CASH"],
+        },
+    ]
 
-    #
-    # while True:
-    #     user_text = input("Ty: ")
-    #     if user_text.lower() == "exit":
-    #         break
-    #     reply = bot.get_response(user_text)
-    #     print("Bot:", reply)
+    while True:
+        try:
+            user_text = input("You: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if user_text.lower().strip() == "exit":
+            break
+
+        reply = bot.get_response(user_text, context=sample_context)
+        print("Bot:", reply)
